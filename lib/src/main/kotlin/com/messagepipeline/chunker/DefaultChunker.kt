@@ -3,122 +3,251 @@ package com.messagepipeline.chunker
 import com.messagepipeline.Chunker
 import com.messagepipeline.Frame
 import java.security.MessageDigest
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
- * 默认分片协议。
+ * 默认 ASCII/hex 分片协议。
  *
- * ## 头格式（ASCII）
+ * 帧格式为 `[index:total:hash:group] payload`。它支持乱序、重复帧和多组交错重组，并对
+ * 未完成消息施加超时及内存上限。MD5 前 8 位只用作传输完整性指纹，不提供密码学安全性。
  *
- * ```
- * [index:total:hash:group] payload
- * ```
- *
- * - `index`：当前帧序号，从 0 开始
- * - `total`：本组总帧数
- * - `hash` ：完整数据的 MD5 前 8 个 hex 字符（用于完整性校验 + 区分不同消息）
- * - `group`：本机生成的 group id（递增整数），用于支持多组并发组装
- * - `payload`：原始字节（**注意**：当前实现把 payload 也用 hex 编码以便和 ASCII 头共存）
- *
- * 例：`[2:5:a3f1c8d9:7] 1f4a3b...`
- *
- * ## 设计取舍
- *
- * - **MD5 不是用作密码学校验**——只是粗略指纹，性能与冲突率折中
- * - **payload 用 hex 编码**：让整帧是 ASCII，方便在二维码 / 文本通道里传输；如果你的
- *   transport 本身就是字节通道（BLE / USB），可以自己实现一个 raw 版省掉编码开销
- * - **assemble 不做超时清理**：调用方负责调用 [reset] 在合适时机清理；否则长期不来的半截
- *   group 会泄漏内存
+ * 过期 group 会在下一次 [assemble] 或显式调用 [cleanupExpired] 时清理；这种惰性清理不会
+ * 创建后台线程。连接重建时可调用 [reset] 立即释放全部中间状态。
  */
-class DefaultChunker : Chunker {
+class DefaultChunker(
+    private val groupTimeoutMillis: Long = DEFAULT_GROUP_TIMEOUT_MILLIS,
+    private val maxPendingGroups: Int = DEFAULT_MAX_PENDING_GROUPS,
+    private val maxPendingBytes: Long = DEFAULT_MAX_PENDING_BYTES,
+    private val maxMessageBytes: Int = DEFAULT_MAX_MESSAGE_BYTES,
+    private val maxFramesPerGroup: Int = DEFAULT_MAX_FRAMES_PER_GROUP,
+    private val timeSourceMillis: () -> Long = { System.nanoTime() / 1_000_000L },
+) : Chunker {
 
-    private val groupCounter = AtomicInteger(0)
-    private val pending = mutableMapOf<Int, MutableMap<Int, ByteArray>>()  // groupId → (idx → payload)
-    private val pendingMeta = mutableMapOf<Int, GroupMeta>()
+    init {
+        require(groupTimeoutMillis > 0) { "groupTimeoutMillis must be > 0" }
+        require(maxPendingGroups > 0) { "maxPendingGroups must be > 0" }
+        require(maxPendingBytes > 0) { "maxPendingBytes must be > 0" }
+        require(maxMessageBytes > 0) { "maxMessageBytes must be > 0" }
+        require(maxFramesPerGroup > 0) { "maxFramesPerGroup must be > 0" }
+    }
+
+    private val groupCounter = AtomicLong(0)
+    private val pending = mutableMapOf<Long, GroupState>()
     private val lock = Any()
+    private var pendingBytes = 0L
 
     override fun split(bytes: ByteArray, mtu: Int): Sequence<Frame> {
-        require(mtu > MIN_MTU) { "mtu must be > $MIN_MTU to fit header" }
-        val payloadBudget = mtu - MAX_HEADER_SIZE
+        require(bytes.size <= maxMessageBytes) {
+            "message is ${bytes.size} bytes, max is $maxMessageBytes"
+        }
+
         val hash = bytes.md5Prefix8()
-        val groupId = groupCounter.getAndIncrement()
-        val total = (bytes.size + payloadBudget - 1) / payloadBudget.coerceAtLeast(1)
+        val groupId = nextGroupId()
+        val layout = calculateLayout(bytes.size, mtu, hash, groupId)
+
         return sequence {
-            for (i in 0 until total) {
-                val from = i * payloadBudget
-                val to = minOf(from + payloadBudget, bytes.size)
-                val payload = bytes.copyOfRange(from, to)
-                val header = "[$i:$total:$hash:$groupId] "
-                val payloadHex = payload.toHex()
-                yield(Frame((header + payloadHex).toByteArray(Charsets.US_ASCII)))
+            if (bytes.isEmpty()) {
+                yield(Frame(header(0, 1, hash, groupId).toByteArray(Charsets.US_ASCII)))
+                return@sequence
+            }
+
+            for (index in 0 until layout.total) {
+                val from = index * layout.payloadBytes
+                val to = minOf(from + layout.payloadBytes, bytes.size)
+                val text = header(index, layout.total, hash, groupId) +
+                    bytes.copyOfRange(from, to).toHex()
+                val frame = Frame(text.toByteArray(Charsets.US_ASCII))
+                check(frame.bytes.size <= mtu) { "internal error: encoded frame exceeds mtu" }
+                yield(frame)
             }
         }
     }
 
     override fun assemble(frame: Frame): ByteArray? {
-        val text = String(frame.bytes, Charsets.US_ASCII)
-        val match = HEADER_RE.find(text) ?: return null
-        val idx = match.groupValues[1].toInt()
-        val total = match.groupValues[2].toInt()
+        val text = frame.bytes.toString(Charsets.US_ASCII)
+        val match = FRAME_RE.matchEntire(text) ?: return null
+        val index = match.groupValues[1].toIntOrNull() ?: return null
+        val total = match.groupValues[2].toIntOrNull() ?: return null
         val hash = match.groupValues[3]
-        val groupId = match.groupValues[4].toInt()
-        val payloadHex = text.substring(match.range.last + 1)
-        val payload = payloadHex.hexDecode() ?: return null
+        val groupId = match.groupValues[4].toLongOrNull() ?: return null
+        val payload = match.groupValues[5].hexDecode() ?: return null
+
+        if (groupId < 0 || total !in 1..maxFramesPerGroup || index !in 0 until total) return null
+        if (payload.size > maxMessageBytes) return null
 
         synchronized(lock) {
-            val map = pending.getOrPut(groupId) { mutableMapOf() }
-            map[idx] = payload
-            pendingMeta.getOrPut(groupId) { GroupMeta(total, hash) }
-            if (map.size < total) return null
+            val now = timeSourceMillis()
+            cleanupExpiredLocked(now)
 
-            // 收齐了：拼接 + 校验 hash
-            val assembled = ByteArray(map.values.sumOf { it.size })
+            var state = pending[groupId]
+            if (state != null && (state.total != total || state.hash != hash)) {
+                removeGroupLocked(groupId)
+                return null
+            }
+
+            if (state == null) {
+                makeRoomForGroupLocked()
+                state = GroupState(total = total, hash = hash, lastUpdatedMillis = now)
+                pending[groupId] = state
+            }
+
+            val previous = state.pieces[index]
+            if (previous != null) {
+                if (!previous.contentEquals(payload)) {
+                    removeGroupLocked(groupId)
+                    return null
+                }
+                state.lastUpdatedMillis = now
+                return null
+            }
+
+            if (state.receivedBytes + payload.size > maxMessageBytes ||
+                !makeRoomForBytesLocked(payload.size.toLong(), excludingGroupId = groupId)
+            ) {
+                removeGroupLocked(groupId)
+                return null
+            }
+
+            state.pieces[index] = payload
+            state.receivedBytes += payload.size
+            state.lastUpdatedMillis = now
+            pendingBytes += payload.size
+
+            if (state.pieces.size < total) return null
+
+            val assembled = ByteArray(state.receivedBytes)
             var cursor = 0
-            for (i in 0 until total) {
-                val piece = map[i] ?: return null
-                System.arraycopy(piece, 0, assembled, cursor, piece.size)
+            for (pieceIndex in 0 until total) {
+                val piece = state.pieces[pieceIndex] ?: return null
+                piece.copyInto(assembled, destinationOffset = cursor)
                 cursor += piece.size
             }
-            pending.remove(groupId)
-            pendingMeta.remove(groupId)
-            return if (assembled.md5Prefix8() == hash) assembled else null
+            removeGroupLocked(groupId)
+            return assembled.takeIf { it.md5Prefix8() == hash }
         }
     }
 
-    /** 主动清空中间状态（比如 transport 重连时）。 */
+    /** 清理已超过 [groupTimeoutMillis] 的未完成 group，返回清理数量。 */
+    fun cleanupExpired(): Int = synchronized(lock) {
+        cleanupExpiredLocked(timeSourceMillis())
+    }
+
+    /** 主动清空全部中间状态，通常在 transport 断开或重连时调用。 */
     fun reset() {
         synchronized(lock) {
             pending.clear()
-            pendingMeta.clear()
+            pendingBytes = 0
         }
     }
 
-    private data class GroupMeta(val total: Int, val hash: String)
+    private fun calculateLayout(
+        messageSize: Int,
+        mtu: Int,
+        hash: String,
+        groupId: Long,
+    ): Layout {
+        require(mtu > 0) { "mtu must be > 0" }
+        var total = 1
+
+        while (true) {
+            val largestHeaderBytes = header(total - 1, total, hash, groupId)
+                .toByteArray(Charsets.US_ASCII).size
+            val payloadBytes = (mtu - largestHeaderBytes) / HEX_CHARS_PER_BYTE
+            if (messageSize == 0) {
+                require(largestHeaderBytes <= mtu) { "mtu $mtu is too small for protocol header" }
+                return Layout(total = 1, payloadBytes = 0)
+            }
+            require(payloadBytes > 0) { "mtu $mtu is too small for protocol header and payload" }
+
+            val calculatedTotal = ((messageSize.toLong() + payloadBytes - 1) / payloadBytes).toInt()
+            require(calculatedTotal <= maxFramesPerGroup) {
+                "message requires $calculatedTotal frames, max is $maxFramesPerGroup"
+            }
+            if (calculatedTotal == total) return Layout(total, payloadBytes)
+            total = calculatedTotal
+        }
+    }
+
+    private fun nextGroupId(): Long = groupCounter.getAndUpdate { current ->
+        if (current == Long.MAX_VALUE) 0 else current + 1
+    }
+
+    private fun makeRoomForGroupLocked() {
+        while (pending.size >= maxPendingGroups) removeOldestGroupLocked()
+    }
+
+    private fun makeRoomForBytesLocked(bytes: Long, excludingGroupId: Long): Boolean {
+        if (bytes > maxPendingBytes) return false
+        while (pendingBytes + bytes > maxPendingBytes) {
+            val oldest = pending.entries
+                .asSequence()
+                .filter { it.key != excludingGroupId }
+                .minByOrNull { it.value.lastUpdatedMillis }
+                ?.key ?: return false
+            removeGroupLocked(oldest)
+        }
+        return true
+    }
+
+    private fun cleanupExpiredLocked(nowMillis: Long): Int {
+        val expired = pending
+            .filterValues { nowMillis - it.lastUpdatedMillis >= groupTimeoutMillis }
+            .keys
+            .toList()
+        expired.forEach(::removeGroupLocked)
+        return expired.size
+    }
+
+    private fun removeOldestGroupLocked() {
+        pending.minByOrNull { it.value.lastUpdatedMillis }?.key?.let(::removeGroupLocked)
+    }
+
+    private fun removeGroupLocked(groupId: Long) {
+        val removed = pending.remove(groupId) ?: return
+        pendingBytes -= removed.receivedBytes
+    }
+
+    private fun header(index: Int, total: Int, hash: String, groupId: Long): String =
+        "[$index:$total:$hash:$groupId] "
+
+    private data class Layout(val total: Int, val payloadBytes: Int)
+
+    private data class GroupState(
+        val total: Int,
+        val hash: String,
+        val pieces: MutableMap<Int, ByteArray> = mutableMapOf(),
+        var receivedBytes: Int = 0,
+        var lastUpdatedMillis: Long,
+    )
 
     companion object {
-        // 头最大 32 字节（[i:total:hash:group] + 空格），保险起见保留 40
-        private const val MAX_HEADER_SIZE = 40
-        private const val MIN_MTU = MAX_HEADER_SIZE
-        private val HEADER_RE = Regex("""\[(\d+):(\d+):([0-9a-f]{8}):(\d+)\] """)
+        const val DEFAULT_GROUP_TIMEOUT_MILLIS = 30_000L
+        const val DEFAULT_MAX_PENDING_GROUPS = 64
+        const val DEFAULT_MAX_PENDING_BYTES = 8L * 1024 * 1024
+        const val DEFAULT_MAX_MESSAGE_BYTES = 4 * 1024 * 1024
+        const val DEFAULT_MAX_FRAMES_PER_GROUP = 100_000
+
+        private const val HEX_CHARS_PER_BYTE = 2
+        private val FRAME_RE = Regex("""\[(\d+):(\d+):([0-9a-f]{8}):(\d+)\] ([0-9a-f]*)""")
     }
 }
 
-private fun ByteArray.md5Prefix8(): String {
-    val md = MessageDigest.getInstance("MD5").digest(this)
-    return md.joinToString("") { "%02x".format(it) }.substring(0, 8)
-}
+private fun ByteArray.md5Prefix8(): String =
+    MessageDigest.getInstance("MD5")
+        .digest(this)
+        .joinToString("") { "%02x".format(it) }
+        .substring(0, 8)
 
-private fun ByteArray.toHex(): String =
-    joinToString("") { "%02x".format(it) }
+private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
 private fun String.hexDecode(): ByteArray? {
     if (length % 2 != 0) return null
     val out = ByteArray(length / 2)
-    for (i in out.indices) {
-        val hi = Character.digit(this[i * 2], 16)
-        val lo = Character.digit(this[i * 2 + 1], 16)
-        if (hi < 0 || lo < 0) return null
-        out[i] = ((hi shl 4) or lo).toByte()
+    for (index in out.indices) {
+        val high = Character.digit(this[index * 2], 16)
+        val low = Character.digit(this[index * 2 + 1], 16)
+        if (high < 0 || low < 0) return null
+        out[index] = ((high shl 4) or low).toByte()
     }
     return out
 }

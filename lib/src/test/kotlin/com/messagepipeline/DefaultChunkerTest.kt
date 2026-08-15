@@ -2,6 +2,7 @@ package com.messagepipeline
 
 import com.messagepipeline.chunker.DefaultChunker
 import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -16,6 +17,24 @@ class DefaultChunkerTest {
         val frames = chunker.split(data, mtu = 200).toList()
         assertTrue("应只切成 1 帧", frames.size == 1)
         assertArrayEquals(data, chunker.assemble(frames[0]))
+    }
+
+    @Test fun `every encoded frame respects mtu after hex expansion`() {
+        val chunker = DefaultChunker()
+        val data = Random(7).nextBytes(2048)
+
+        for (mtu in listOf(48, 64, 80, 185)) {
+            val frames = chunker.split(data, mtu).toList()
+            assertTrue("mtu=$mtu", frames.all { it.bytes.size <= mtu })
+        }
+    }
+
+    @Test fun `empty payload produces one frame and roundtrips`() {
+        val chunker = DefaultChunker()
+        val frames = chunker.split(ByteArray(0), mtu = 64).toList()
+
+        assertEquals(1, frames.size)
+        assertArrayEquals(ByteArray(0), chunker.assemble(frames.single()))
     }
 
     @Test fun `roundtrip multi frame in order`() {
@@ -80,5 +99,39 @@ class DefaultChunkerTest {
         val got = results.sortedBy { it.contentHashCode() }
         assertArrayEquals(expected[0], got[0])
         assertArrayEquals(expected[1], got[1])
+    }
+
+    @Test fun `expired incomplete group is discarded`() {
+        var now = 0L
+        val chunker = DefaultChunker(
+            groupTimeoutMillis = 100,
+            timeSourceMillis = { now },
+        )
+        val frames = chunker.split(Random(9).nextBytes(500), mtu = 64).toList()
+        assertNull(chunker.assemble(frames.first()))
+
+        now = 100
+        assertEquals(1, chunker.cleanupExpired())
+        for (frame in frames.drop(1)) assertNull(chunker.assemble(frame))
+    }
+
+    @Test fun `conflicting duplicate invalidates group`() {
+        val chunker = DefaultChunker()
+        val frames = chunker.split(Random(3).nextBytes(200), mtu = 64).toList()
+        assertNull(chunker.assemble(frames.first()))
+
+        val corrupted = frames.first().bytes.copyOf().also { bytes ->
+            bytes[bytes.lastIndex] = if (bytes.last() == '0'.code.toByte()) '1'.code.toByte() else '0'.code.toByte()
+        }
+        assertNull(chunker.assemble(Frame(corrupted)))
+        for (frame in frames.drop(1)) assertNull(chunker.assemble(frame))
+    }
+
+    @Test fun `rejects malformed metadata and trailing data`() {
+        val chunker = DefaultChunker()
+        assertNull(chunker.assemble(Frame("[1:1:d41d8cd9:0] ".toByteArray())))
+        assertNull(chunker.assemble(Frame("[0:0:d41d8cd9:0] ".toByteArray())))
+        assertNull(chunker.assemble(Frame("junk[0:1:d41d8cd9:0] ".toByteArray())))
+        assertNull(chunker.assemble(Frame("[0:1:d41d8cd9:0] 00!".toByteArray())))
     }
 }

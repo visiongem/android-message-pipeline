@@ -28,6 +28,7 @@ interface Codec<T> {
  * 默认实现 [com.messagepipeline.chunker.DefaultChunker] 使用
  *   `[index:total:hash:groupId] payload`
  * 头格式，支持乱序到达 + 多组并发。
+ * 字节通道可使用 [com.messagepipeline.chunker.BinaryChunker] 降低帧头与 hex 编码开销。
  */
 interface Chunker {
     /** 把 [bytes] 切片。返回的 Frame 序列**包含完整头**，可直接送到 [Transport]。 */
@@ -56,7 +57,7 @@ data class Frame(val bytes: ByteArray) {
  * 实现示例：[com.messagepipeline.transport.LoopbackTransport]（用于测试）
  */
 interface Transport {
-    /** 通道的 MTU 字节数（一帧能写多少）。BLE 默认 23，USB 64KB，串口看波特率…… */
+    /** 通道可承载的 [Frame.bytes] 字节数。BLE 实现返回的是 ATT MTU 扣除协议头后的值。 */
     val mtu: Int
 
     /** 发送一帧。**阻塞**直到完成或抛异常。 */

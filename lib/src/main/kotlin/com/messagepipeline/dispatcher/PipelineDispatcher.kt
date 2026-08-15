@@ -24,18 +24,21 @@ class PipelineDispatcher<T>(
     private val chunker: Chunker,
     private val transport: Transport,
     private val onMessage: (T) -> Unit,
+    private val onError: (Throwable) -> Unit = {},
 ) {
 
     private val incomingFrames: BlockingQueue<Frame> = LinkedBlockingQueue()
+    private val started = AtomicBoolean(false)
     private val running = AtomicBoolean(false)
     private var readerThread: Thread? = null
     private var dispatcherThread: Thread? = null
 
     fun start() {
-        check(running.compareAndSet(false, true)) { "already started" }
+        check(started.compareAndSet(false, true)) { "already started" }
+        running.set(true)
 
         // transport 收到的帧放入队列
-        transport.onReceive { frame -> incomingFrames.offer(frame) }
+        transport.onReceive { frame -> if (running.get()) incomingFrames.offer(frame) }
 
         readerThread = Thread({ readerLoop() }, "MessagePipeline-Reader").also { it.start() }
         dispatcherThread = Thread({ dispatcherLoop() }, "MessagePipeline-Dispatcher").also { it.start() }
@@ -67,7 +70,7 @@ class PipelineDispatcher<T>(
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt(); return
             } catch (t: Throwable) {
-                // TODO: 暴露错误回调；当前简化实现忽略
+                runCatching { onError(t) }
             }
         }
     }
@@ -79,6 +82,8 @@ class PipelineDispatcher<T>(
                 onMessage(message)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt(); return
+            } catch (t: Throwable) {
+                runCatching { onError(t) }
             }
         }
     }

@@ -10,3 +10,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "android-message-pipeline"
 include(":lib")
+include(":sample")

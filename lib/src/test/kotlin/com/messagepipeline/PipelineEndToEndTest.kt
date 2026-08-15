@@ -5,11 +5,28 @@ import com.messagepipeline.codec.StringCodec
 import com.messagepipeline.dispatcher.PipelineDispatcher
 import com.messagepipeline.transport.LoopbackTransport
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 class PipelineEndToEndTest {
+
+    @Test fun `dispatcher cannot be restarted after stop`() {
+        val transport = LoopbackTransport()
+        val pipeline = PipelineDispatcher(
+            codec = StringCodec,
+            chunker = DefaultChunker(),
+            transport = transport,
+            onMessage = {},
+        )
+
+        pipeline.start()
+        pipeline.stop()
+
+        assertThrows(IllegalStateException::class.java) { pipeline.start() }
+        transport.close()
+    }
 
     @Test fun `alice sends 5KB string, bob receives intact`() {
         val (alice, bob) = LoopbackTransport.pair(mtu = 80)
